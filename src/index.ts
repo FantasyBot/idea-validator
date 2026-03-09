@@ -1,3 +1,4 @@
+import "dotenv/config";
 import * as readline from "readline";
 import { Command } from "@langchain/langgraph";
 import { graph } from "./graph";

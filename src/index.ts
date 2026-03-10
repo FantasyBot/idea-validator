@@ -1,7 +1,10 @@
 import "dotenv/config";
 import * as readline from "readline";
+import * as fs from "fs";
+import * as path from "path";
 import { Command } from "@langchain/langgraph";
 import { graph } from "./graph";
+import { startSession, makeThreadConfig } from "./service";
 
 // ---------------------------------------------------------------------------
 // Readline helpers
@@ -25,8 +28,11 @@ function hr(char = "─", width = 60) {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  const modelName = process.env.OPENAI_MODEL ?? "gpt-4o";
+  const researchEnabled = !!process.env.TAVILY_API_KEY;
+
   console.log("\n" + hr("═"));
-  console.log("  STARTUP VALIDATOR MVP  —  Powered by LangGraph + Claude");
+  console.log(`  STARTUP VALIDATOR MVP  —  Powered by LangGraph + ${modelName}`);
   console.log(hr("═") + "\n");
 
   // ── Phase 0: Collect the startup idea ───────────────────────────────────
@@ -40,35 +46,16 @@ async function main() {
     process.exit(1);
   }
 
-  // Each session gets its own thread so multiple runs don't bleed into each other.
-  const threadConfig = {
-    configurable: { thread_id: `session-${Date.now()}` },
-  };
-
   console.log("\n" + hr());
-  console.log("Analyzing your idea...");
+  if (researchEnabled) {
+    console.log("Researching market & competitors via Tavily...");
+  } else {
+    console.log("Analyzing your idea...");
+  }
   console.log(hr() + "\n");
 
-  // ── Phase 1: Run the graph until interrupt ───────────────────────────────
-  // interrogatorNode calls interrupt() after generating questions, so invoke()
-  // returns early with __interrupt__ populated rather than completing the graph.
-  const snapshot = await graph.invoke({ initialIdea }, threadConfig);
-
-  // Type-safe access to the interrupt payload
-  const interrupts = (
-    snapshot as typeof snapshot & {
-      __interrupt__?: Array<{ value: { questions: string[] } }>;
-    }
-  ).__interrupt__;
-
-  if (!interrupts || interrupts.length === 0) {
-    // Should not happen in normal flow, but handle gracefully
-    console.error("Graph completed without reaching the interrupt. Exiting.");
-    rl.close();
-    process.exit(1);
-  }
-
-  const { questions } = interrupts[0].value;
+  // ── Phase 1: Run graph to interrupt (research + interrogator) ────────────
+  const { sessionId, questions } = await startSession(initialIdea);
 
   // ── Phase 2: Present questions, collect answers ──────────────────────────
   console.log(hr());
@@ -85,24 +72,63 @@ async function main() {
   }
 
   console.log(hr());
-  console.log("Generating your roast report...");
-  console.log(hr() + "\n");
+  console.log("Generating your roast report...\n");
 
-  // ── Phase 3: Resume the graph with answers ───────────────────────────────
-  // Command({ resume: value }) is the LangGraph primitive for resuming after
-  // an interrupt. The `value` is returned by interrupt() inside interrogatorNode.
-  // Using the SAME threadConfig ties this call to the persisted checkpoint.
-  const finalState = await graph.invoke(
+  // ── Phase 3: Resume graph and stream the roast report ───────────────────
+  // graph.streamEvents() with version "v2" emits on_chat_model_stream events
+  // for every token the roaster model produces, giving real-time output.
+  const threadConfig = makeThreadConfig(sessionId);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for await (const event of (graph as any).streamEvents(
     new Command({ resume: answers }),
-    threadConfig
-  );
+    { ...threadConfig, version: "v2" }
+  )) {
+    if (
+      event.event === "on_chat_model_stream" &&
+      event.metadata?.langgraph_node === "roaster"
+    ) {
+      const content = event.data?.chunk?.content;
+      if (typeof content === "string" && content) {
+        process.stdout.write(content);
+      }
+    }
+  }
 
-  // ── Phase 4: Print the roast report ─────────────────────────────────────
+  process.stdout.write("\n");
+
+  // ── Phase 4: Retrieve final state for score + saving ────────────────────
+  const snapshot = await graph.getState(threadConfig);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const finalValues = snapshot.values as any;
+  const score: number = finalValues.viabilityScore ?? 0;
+  const report: string = finalValues.roastReport ?? "";
+
   console.log("\n" + hr("═"));
-  console.log("  ROAST REPORT");
+  console.log(`  VIABILITY SCORE: ${score}/100`);
   console.log(hr("═") + "\n");
-  console.log(finalState.roastReport ?? "No report generated.");
-  console.log("\n" + hr("═") + "\n");
+
+  // ── Phase 5: Save report to ./reports/<timestamp>.md ────────────────────
+  if (report) {
+    const reportsDir = path.join(process.cwd(), "reports");
+    fs.mkdirSync(reportsDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const reportFile = path.join(reportsDir, `${timestamp}.md`);
+    const reportContent = [
+      `# Startup Validator Report`,
+      ``,
+      `**Date:** ${new Date().toISOString()}`,
+      `**Model:** ${modelName}`,
+      `**Idea:** ${initialIdea}`,
+      `**Viability Score:** ${score}/100`,
+      ``,
+      `---`,
+      ``,
+      report,
+    ].join("\n");
+    fs.writeFileSync(reportFile, reportContent, "utf-8");
+    console.log(`Report saved to: reports/${path.basename(reportFile)}\n`);
+  }
 
   rl.close();
 }

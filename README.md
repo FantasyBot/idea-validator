@@ -1,19 +1,19 @@
 # Startup Validator MVP
 
-A CLI tool that stress-tests your startup idea using a two-agent LangGraph pipeline with a human-in-the-loop interrogation step. It asks you three brutal due-diligence questions, waits for your answers, then delivers a blunt "roast report" written by a cynical CTO persona.
+A CLI tool that stress-tests your startup idea using a multi-agent LangGraph pipeline with a human-in-the-loop interrogation step. It optionally researches your market, asks you N brutal due-diligence questions, streams a blunt roast report written by a cynical CTO persona, and saves it to disk with a 0–100 viability score.
 
 ---
 
 ## How It Works
 
-The tool runs a linear two-node LangGraph graph with a `interrupt()` pause between the nodes:
-
 ```
 __start__
     │
-interrogator  ◄── LLM generates 3 hard-hitting questions, then PAUSES here
+ research     ◄── searches for competitors + market data via Tavily (skipped if no API key)
+    │
+interrogator  ◄── LLM generates N hard-hitting questions, then PAUSES here
     │              (you answer in the CLI)
- roaster       ◄── LLM reads your answers and delivers the roast report
+  roaster     ◄── LLM reads your answers, streams the roast report
     │
  __end__
 ```
@@ -23,10 +23,11 @@ interrogator  ◄── LLM generates 3 hard-hitting questions, then PAUSES here
 | Phase | What happens |
 |-------|-------------|
 | **0 — Idea input** | You type your startup idea into the CLI |
-| **1 — Interrogation** | The `interrogatorNode` calls GPT-4o with a VC due-diligence persona and generates exactly 3 questions via structured output (Zod schema). The graph then pauses via `interrupt()` and surfaces the questions to you. |
-| **2 — Your answers** | The CLI collects your 3 answers one by one |
-| **3 — Resume & roast** | The graph resumes via `Command({ resume: answers })`. The `roasterNode` receives the full state (idea + questions + answers) and generates a structured markdown roast report. |
-| **4 — Report** | The report is printed to your terminal |
+| **1 — Research** | If `TAVILY_API_KEY` is set, searches for real competitors and market data. Summarised into a brief that feeds both the interrogator and roaster. Skipped silently if not configured. |
+| **2 — Interrogation** | The `interrogatorNode` generates N questions (default 3) via structured output (Zod schema). The graph pauses via `interrupt()` and surfaces the questions to you. |
+| **3 — Your answers** | The CLI collects your answers one by one |
+| **4 — Resume & roast** | The graph resumes via `Command({ resume: answers })`. The `roasterNode` receives the full state and streams a markdown report with blind spots, severity ratings, and a viability score. |
+| **5 — Save** | Report is written to `./reports/<timestamp>.md` |
 
 ---
 
@@ -35,66 +36,79 @@ interrogator  ◄── LLM generates 3 hard-hitting questions, then PAUSES here
 ```
 startup-validator-mvp/
 ├── src/
-│   ├── index.ts   — CLI entry point (readline loop, interrupt/resume orchestration)
-│   ├── graph.ts   — StateGraph definition and MemorySaver checkpointer setup
-│   ├── nodes.ts   — interrogatorNode and roasterNode implementations
-│   └── state.ts   — ValidatorStateAnnotation (shared graph state channels)
+│   ├── index.ts    — CLI entry point (readline loop, streaming, report saving)
+│   ├── graph.ts    — StateGraph definition and MemorySaver checkpointer setup
+│   ├── nodes.ts    — researchNode, interrogatorNode, roasterNode
+│   ├── service.ts  — startSession / finishSession (shared graph invocation logic)
+│   └── state.ts    — ValidatorStateAnnotation (shared graph state channels)
+├── reports/        — auto-created, one .md file per run
 ├── package.json
 └── tsconfig.json
 ```
 
 ### `src/state.ts` — Shared Graph State
 
-Defines the 5 state channels shared across all nodes:
+| Channel | Type | Purpose |
+|---------|------|---------|
+| `messages` | `BaseMessage[]` | Standard LangChain message history |
+| `initialIdea` | `string` | The raw startup idea text |
+| `researchSummary` | `string` | Market intelligence brief from the research node |
+| `interrogationQuestions` | `string[]` | Questions from the interrogator |
+| `userAnswers` | `string[]` | Answers from the user |
+| `roastReport` | `string` | Final markdown report from the roaster |
+| `viabilityScore` | `number` | 0–100 score parsed from the roast report |
 
-| Channel | Type | Reducer | Purpose |
-|---------|------|---------|---------|
-| `messages` | `BaseMessage[]` | append/dedup by ID | Standard LangChain message history |
-| `initialIdea` | `string` | replace | The raw startup idea text |
-| `interrogationQuestions` | `string[]` | replace | 3 questions from the interrogator |
-| `userAnswers` | `string[]` | replace | 3 answers from the user |
-| `roastReport` | `string` | replace | Final markdown report from the roaster |
+### `src/nodes.ts` — The Three Agents
 
-### `src/nodes.ts` — The Two Agents
+**`researchNode`**
+- Runs only when `TAVILY_API_KEY` is set; returns `researchSummary: ""` otherwise
+- Makes two parallel Tavily searches (competitors, market size/trends)
+- Summarises findings into a 3–4 paragraph market intelligence brief
+- That brief is injected into both the interrogator and roaster prompts
 
 **`interrogatorNode`**
 - Persona: relentless VC due-diligence analyst
-- Uses `.withStructuredOutput(QuestionsSchema)` to guarantee exactly 3 questions as a typed JSON array
-- Calls `interrupt({ questions })` to pause execution and pass the questions to the CLI
-- On resume, `interrupt()` returns the user's answers array
-- Returns `{ interrogationQuestions, userAnswers }` into state
+- Uses `.withStructuredOutput(QuestionsSchema)` to guarantee exactly N questions as a typed JSON array
+- Question count is controlled by `INTERROGATION_QUESTIONS` env var (default `3`, max `10`)
+- Incorporates `researchSummary` to ask market-aware questions
+- Calls `interrupt({ questions })` to pause execution; on resume, `interrupt()` returns the user's answers
 
 **`roasterNode`**
 - Persona: cynical battle-scarred CTO
-- Receives the full populated state
-- Produces a structured markdown report with these sections:
-  - `## Verdict` — one punchy survivability sentence
-  - `## Blind Spot #1/2/3` — analysis + severity rating (🔴 Fatal / 🟠 Serious / 🟡 Manageable)
-  - `## Survival Roadmap` — only if the idea is salvageable, otherwise `## Time of Death`
+- Receives the full populated state (idea + research + questions + answers)
+- Produces a structured markdown report:
+  - `## Viability Score: [0-100]/100` — calibrated survivability score
+  - `## Verdict` — one punchy sentence
+  - `## Blind Spot #1/2/3` — analysis + severity (🔴 Fatal / 🟠 Serious / 🟡 Manageable)
+  - `## Survival Roadmap` — if salvageable, otherwise `## Time of Death`
+- Score is parsed from the report and stored separately in `viabilityScore`
 
-### `src/graph.ts` — Graph Wiring
+### `src/service.ts` — Shared Session Logic
 
-- `StateGraph` with `ValidatorStateAnnotation`
-- Linear edges: `__start__` → `interrogator` → `roaster` → `__end__`
-- `MemorySaver` checkpointer — required for `interrupt`/`Command` resume to work (serializes graph state between the two `invoke()` calls)
-- Each CLI run gets a unique `thread_id: session-${Date.now()}` to prevent state bleed between sessions
+```typescript
+startSession(idea)              // runs research + interrogator, returns { sessionId, questions }
+finishSession(sessionId, answers) // resumes graph, returns { report, score }
+```
 
 ### `src/index.ts` — CLI Orchestration
 
-The two-phase invoke pattern:
+Phase 1 uses `startSession()`. Phase 3 uses `graph.streamEvents()` directly to stream roast tokens to stdout in real time, then `graph.getState()` to retrieve the final score.
 
 ```typescript
-// Phase 1: run until interrupt
-const snapshot = await graph.invoke({ initialIdea }, threadConfig);
-const { questions } = snapshot.__interrupt__[0].value;
+// Phase 1: run until interrupt (research + interrogator)
+const { sessionId, questions } = await startSession(initialIdea);
 
 // ... collect answers from user ...
 
-// Phase 2: resume with answers
-const finalState = await graph.invoke(
-  new Command({ resume: answers }),
-  threadConfig   // same thread_id — ties back to the checkpoint
-);
+// Phase 3: stream the roast report token by token
+for await (const event of graph.streamEvents(new Command({ resume: answers }), config)) {
+  if (event.event === "on_chat_model_stream" && event.metadata?.langgraph_node === "roaster") {
+    process.stdout.write(event.data.chunk.content);
+  }
+}
+
+// Get score + save to disk
+const { values } = await graph.getState(config);
 ```
 
 ---
@@ -112,11 +126,17 @@ const finalState = await graph.invoke(
 # 1. Install dependencies
 npm install
 
-# 2. Set your OpenAI API key
-export OPENAI_API_KEY=sk-...
+# 2. Copy and fill in environment variables
+cp .env.example .env
+```
 
-# 3. (Optional) Override the model — default is gpt-4o
-export OPENAI_MODEL=gpt-4o-mini
+Edit `.env`:
+
+```env
+OPENAI_API_KEY=sk-...           # required
+OPENAI_MODEL=gpt-4o             # optional, default: gpt-4o
+TAVILY_API_KEY=tvly-...         # optional — enables market research
+INTERROGATION_QUESTIONS=3       # optional — number of questions (1-10)
 ```
 
 ---
@@ -131,36 +151,46 @@ Example session:
 
 ```
 ════════════════════════════════════════════════════════════
-  STARTUP VALIDATOR MVP  —  Powered by LangGraph + Claude
+  STARTUP VALIDATOR MVP  —  Powered by LangGraph + gpt-4o
 ════════════════════════════════════════════════════════════
 
 Describe your startup idea (be specific):
 > An AI-powered platform that automatically negotiates SaaS contracts on behalf of SMBs
 
-────────────────────────────────────────────────────────────
-Analyzing your idea...
-────────────────────────────────────────────────────────────
+Researching market & competitors via Tavily...
 
+────────────────────────────────────────────────────────────
 DUE DILIGENCE — Answer honestly. Vague answers = brutal roast.
-
-Q1: How do you handle liability when your AI negotiation goes wrong ...
-Your answer: _
-
-Q2: What prevents SaaS vendors from simply refusing to negotiate ...
-Your answer: _
-
-Q3: What's your data moat if OpenAI or a legal-tech incumbent ...
-Your answer: _
-
 ────────────────────────────────────────────────────────────
+
+Q1: How do you handle liability when your AI negotiation goes wrong?
+Your answer: _
+
+Q2: What prevents SaaS vendors from simply refusing to negotiate?
+Your answer: _
+
+Q3: What's your data moat if an incumbent replicates this in 90 days?
+Your answer: _
+
 Generating your roast report...
+
+## Viability Score: 34/100
+...
+
 ════════════════════════════════════════════════════════════
-  ROAST REPORT
+  VIABILITY SCORE: 34/100
 ════════════════════════════════════════════════════════════
 
-## Verdict
-...
+Report saved to: reports/2026-03-10T14-32-00-000Z.md
 ```
+
+---
+
+## Known Limitations
+
+- **No data handling controls** — your idea and answers are sent to OpenAI's API and (if configured) Tavily. Not suitable for confidential ideas or enterprise use without adding a local model path and explicit data disclosure
+- **Score is uncalibrated** — the 0–100 score is LLM-generated, not benchmarked against real startup outcomes. Treat it as a structured opinion, not a prediction
+- **No retention** — each run is independent. There is no longitudinal tracking, cohort benchmarking, or follow-up mechanism yet
 
 ---
 
@@ -178,19 +208,19 @@ Generating your roast report...
 
 | Package | Version | Role |
 |---------|---------|------|
-| `@langchain/langgraph` | ^1.2 | Graph execution engine, `interrupt`/`Command`, `MemorySaver` |
+| `@langchain/langgraph` | ^1.2 | Graph execution, `interrupt`/`Command`, `MemorySaver`, `streamEvents` |
 | `@langchain/openai` | ^1.2 | ChatOpenAI model wrapper |
 | `@langchain/core` | ^1.1 | Message types, base abstractions |
 | `zod` | ^3.25 | Structured output schema for interrogator |
+| `dotenv` | ^17 | Environment variable loading |
 | `tsx` | ^4.21 | Run TypeScript directly — no build step needed in dev |
 
 ---
 
-## Production Notes
+## Production Roadmap
 
-To move beyond the MVP:
-
-1. **Persistent checkpointer** — swap `MemorySaver` for `SqliteSaver` or `@langchain/langgraph-checkpoint-postgres`. No node or CLI code needs to change.
-2. **REST API** — wrap `graph.invoke()` in Express/Fastify endpoints. Phase 1 returns a job ID; Phase 2 takes the job ID + answers.
-3. **Streaming** — replace `graph.invoke()` with `graph.stream()` to stream roast report tokens to the client.
-4. **Model** — set `OPENAI_MODEL=gpt-4o` for highest quality, or `gpt-4o-mini` for lower cost.
+1. **Persistent checkpointer** — swap `MemorySaver` for `SqliteSaver` or `@langchain/langgraph-checkpoint-postgres`. No node or service code needs to change.
+2. **Local model support** — swap `ChatOpenAI` for `ChatOllama` in `nodes.ts` for zero data egress. Controlled via `MODEL_PROVIDER` env var.
+3. **Data disclosure** — print a consent notice at startup listing exactly which external APIs receive data.
+4. **Longitudinal tracking** — resurface old reports and re-evaluate after 90 days to create a commitment device and improve score calibration over time.
+5. **Cohort benchmarking** — aggregate anonymised scores to make the viability number meaningful relative to other ideas in the dataset.
